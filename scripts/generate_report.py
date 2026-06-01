@@ -17,6 +17,7 @@ Usage :
                               [--images-file <images.txt>]
 """
 
+
 from __future__ import annotations
 
 import argparse
