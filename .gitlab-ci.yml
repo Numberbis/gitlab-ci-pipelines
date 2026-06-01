@@ -1,0 +1,132 @@
+---
+# Pipeline GitLab CI : scan Trivy multi-images + rapport consolidé.
+#
+# Étapes :
+#   1. scan   : lance Trivy sur chaque image listée dans images.txt et
+#               produit un JSON par image dans reports/.
+#   2. report : agrège les JSON en un rapport global priorisé (Markdown + JSON).
+#
+# La liste des images est lue depuis images.txt (une image par ligne).
+# Le pipeline ne fait jamais échouer le build sur des vulnérabilités : il
+# produit un rapport informatif. Des seuils d'échec pourront être ajoutés
+# plus tard, une fois les montées de versions terminées.
+
+stages:
+  - scan
+  - report
+  - publish
+
+variables:
+  TRIVY_VERSION: "0.50.1"
+  TRIVY_NO_PROGRESS: "true"
+  TRIVY_CACHE_DIR: ".trivycache"
+  IMAGES_FILE: "images.txt"
+
+scan-images:
+  stage: scan
+  image:
+    name: aquasec/trivy:${TRIVY_VERSION}
+    entrypoint: [""]
+  cache:
+    key: trivy-db
+    paths:
+      - ${TRIVY_CACHE_DIR}/
+  script:
+    - mkdir -p reports
+    - |
+      # Boucle sur chaque image non commentée du fichier.
+      # Syntaxe acceptée : "<image>" ou "<image> => <image_cible>". Seule
+      # la partie avant "=>" est scannée ; la cible est utilisée par le
+      # rapport pour suggérer la montée de version.
+      # --exit-code 0 : on ne fait jamais échouer le job de scan ici, la
+      # décision d'échec est centralisée dans le job de rapport.
+      while IFS= read -r line || [ -n "$line" ]; do
+        clean="$(echo "$line" | sed 's/#.*//')"
+        source_part="$(echo "$clean" | awk -F '=>' '{print $1}')"
+        image="$(echo "$source_part" | tr -d '[:space:]')"
+        [ -z "$image" ] && continue
+        safe="$(echo "$image" | tr -c 'A-Za-z0-9_-' '_')"
+        echo "===== Scan de ${image} ====="
+        trivy image \
+          --severity CRITICAL,HIGH \
+          --format json \
+          --output "reports/${safe}.json" \
+          --cache-dir "${TRIVY_CACHE_DIR}" \
+          --timeout 10m \
+          --exit-code 0 \
+          "${image}"
+      done < "${IMAGES_FILE}"
+  artifacts:
+    when: always
+    paths:
+      - reports/
+    expire_in: 1 week
+
+generate-report:
+  stage: report
+  image: python:3.11-slim
+  needs:
+    - job: scan-images
+      artifacts: true
+  script:
+    - python3 scripts/generate_report.py reports/ report.md report.json --images-file "${IMAGES_FILE}"
+    - echo "===== Aperçu du rapport ====="
+    - head -n 40 report.md || true
+  artifacts:
+    when: always
+    paths:
+      - report.md
+      - report.json
+      - reports/
+    reports:
+      # Permet d'afficher les vulnérabilités dans le widget MR de GitLab.
+      container_scanning: report.json
+    expire_in: 1 month
+
+convert-html:
+  stage: publish
+  image: python:3.11-slim
+  needs:
+    - job: generate-report
+      artifacts: true
+  variables:
+    # À surcharger dans les variables CI/CD du projet :
+    #   ARTIFACTORY_BASE_URL : ex. https://artifactory.example.com/artifactory/my-repo/trivy-reports
+    #   ARTIFACTORY_USER     : compte de service (variable masquée)
+    #   ARTIFACTORY_TOKEN    : token / mot de passe (variable masquée + protégée)
+    ARTIFACTORY_BASE_URL: ""
+  script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends curl >/dev/null
+    - pip install --quiet --no-cache-dir markdown==3.6
+    - python3 scripts/convert_to_html.py report.md report.html
+    - |
+      # Garde-fous : on n'envoie rien si une variable est manquante.
+      missing=""
+      [ -z "${ARTIFACTORY_BASE_URL}" ] && missing="${missing} ARTIFACTORY_BASE_URL"
+      [ -z "${ARTIFACTORY_USER}" ]     && missing="${missing} ARTIFACTORY_USER"
+      [ -z "${ARTIFACTORY_TOKEN}" ]    && missing="${missing} ARTIFACTORY_TOKEN"
+      if [ -n "${missing}" ]; then
+        echo "Variables manquantes :${missing}" >&2
+        echo "Définis-les dans Settings > CI/CD > Variables avant de relancer." >&2
+        exit 1
+      fi
+    - |
+      # Upload daté + alias "latest". --fail transforme un 4xx/5xx en
+      # erreur shell, --silent+--show-error garde les logs propres tout
+      # en remontant les erreurs HTTP.
+      timestamp="$(date -u +%Y%m%d-%H%M%S)"
+      base="${ARTIFACTORY_BASE_URL%/}"
+      for target in "report-${timestamp}.html" "report-latest.html"; do
+        url="${base}/${target}"
+        echo "===== Upload vers ${url} ====="
+        curl --fail --silent --show-error \
+          -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" \
+          -T report.html \
+          "${url}"
+        echo ""
+      done
+  artifacts:
+    when: always
+    paths:
+      - report.html
+    expire_in: 1 month

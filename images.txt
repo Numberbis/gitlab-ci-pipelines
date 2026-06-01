@@ -1,0 +1,14 @@
+# Liste des images Docker à scanner (une par ligne).
+# Les lignes vides et celles commençant par '#' sont ignorées.
+#
+# Syntaxe :
+#   <image>                       — scanne l'image, cible "à définir" dans le rapport
+#   <image> => <image_cible>      — scanne l'image et affiche la cible recommandée
+#
+# Exemple :
+#   nginx:1.21 => nginx:1.27
+nginx:1.21 => nginx:1.27
+python:3.9-slim => python:3.12-slim
+node:18-alpine => node:22-alpine
+redis:7.0 => redis:7.4
+postgres:14 => postgres:16
